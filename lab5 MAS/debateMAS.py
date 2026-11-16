@@ -4,6 +4,9 @@ IS 590R -- AI and Agentic Systems
 """
 
 import json
+import os
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
 from typing_extensions import TypedDict
 from langgraph.graph import END, START, StateGraph
@@ -12,6 +15,41 @@ from langchain.chat_models import init_chat_model
 from langchain_tavily import TavilySearch
 
 load_dotenv()
+
+
+def _append_trace(record: dict) -> None:
+    """Append one observation when DEBATE_TRACE_PATH is set.
+
+    This records prompts, tool activity, and outputs. It does not alter
+    the debate, add evidence, or change a participant's response.
+    """
+    path = os.environ.get("DEBATE_TRACE_PATH")
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    record = {"ts": datetime.now(timezone.utc).isoformat(), **record}
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, default=str) + "\n")
+
+
+def _trace_messages(messages) -> list[dict]:
+    traced = []
+    for message in messages:
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and len(content) > 50000:
+            content = content[:50000] + "\n...[truncated by tracer]"
+        traced.append({
+            "type": getattr(message, "type", None),
+            "text": getattr(message, "text", None),
+            "content": content,
+            "tool_calls": getattr(message, "tool_calls", None) or [],
+            "usage_metadata": getattr(message, "usage_metadata", None),
+            "response_metadata": getattr(message, "response_metadata", None),
+            "id": getattr(message, "id", None),
+        })
+    return traced
 
 model = init_chat_model("ollama:qwen2.5:7b")
 web_search = TavilySearch(max_results=5, topic="general")
@@ -189,6 +227,13 @@ def agent_position_a(state: DebateState) -> dict:
         {"messages": [{"role": "user", "content": user_content}]}
     )
     _describe_tool_usage("build_advocate", result["messages"])
+    _append_trace({
+        "event": "participant",
+        "participant": "build_advocate",
+        "round_before": state["round"],
+        "input": user_content,
+        "messages": _trace_messages(result["messages"]),
+    })
     # Extension: preserve BUILD's argument while keeping the latest-position output.
     argument = result["messages"][-1].text
     current_round = state["round"] + 1
@@ -214,6 +259,13 @@ def agent_position_b(state: DebateState) -> dict:
         {"messages": [{"role": "user", "content": user_content}]}
     )
     _describe_tool_usage("buy_advocate", result["messages"])
+    _append_trace({
+        "event": "participant",
+        "participant": "buy_advocate",
+        "round_before": state["round"],
+        "input": user_content,
+        "messages": _trace_messages(result["messages"]),
+    })
     # Extension: append BUY's argument using the round already incremented by BUILD.
     argument = result["messages"][-1].text
     return {
@@ -230,17 +282,25 @@ def run_fact_checker(state: DebateState) -> dict:
     Nodes execute sequentially, so each returns the entire updated list.
     The next advocates and the moderator see this report through history.
     """
+    user_content = (
+        f"Case assumptions:\n{state['case']}\n\n"
+        f"Complete debate history:\n{format_history(state)}\n\n"
+        f"Review round {state['round']}. Check the latest claims against "
+        "external sources, taking earlier arguments and findings into account."
+    )
     result = fact_checker.invoke({"messages": [{
         "role": "user",
-        "content": (
-            f"Case assumptions:\n{state['case']}\n\n"
-            f"Complete debate history:\n{format_history(state)}\n\n"
-            f"Review round {state['round']}. Check the latest claims against "
-            "external sources, taking earlier arguments and findings into account."
-        ),
+        "content": user_content,
     }]})
     messages = result["messages"]
     _describe_tool_usage("fact_checker", messages)
+    _append_trace({
+        "event": "participant",
+        "participant": "fact_checker",
+        "round": state["round"],
+        "input": user_content,
+        "messages": _trace_messages(messages),
+    })
     report = (
         f"Round {state['round']} - FACT CHECK:\n{messages[-1].text}\n\n"
         f"{_fact_check_search_record(messages)}"
@@ -250,27 +310,35 @@ def run_fact_checker(state: DebateState) -> dict:
 
 
 def moderator(state: DebateState) -> dict:
+    system_content = (
+        "You are a neutral moderator. Review the complete debate "
+        "history and recommend BUILD or BUY. Consider evidence and "
+        "rebuttals from every round, including points left unanswered. "
+        "Consider the saved fact-check findings and their program-recorded "
+        "search activity. A report flagged unverified is not verification. "
+        "A returned URL alone does not establish support for a claim. "
+        "Distinguish CASE assumptions from externally checked claims, "
+        "and acknowledge unresolved or conflicting findings. "
+        "Do not treat repeated claims as additional evidence. "
+        "Name the single most important trade-off explicitly, and "
+        "state the recommendation in the first sentence."
+    )
+    user_content = (
+        f"Case:\n{state['case']}\n\n"
+        f"Complete debate history:\n{format_history(state)}"
+    )
     response = model.invoke([
         # Extension: judge evidence and unanswered rebuttals across every round.
-        {"role": "system", "content": (
-            "You are a neutral moderator. Review the complete debate "
-            "history and recommend BUILD or BUY. Consider evidence and "
-            "rebuttals from every round, including points left unanswered. "
-            "Consider the saved fact-check findings and their program-recorded "
-            "search activity. A report flagged unverified is not verification. "
-            "A returned URL alone does not establish support for a claim. "
-            "Distinguish CASE assumptions from externally checked claims, "
-            "and acknowledge unresolved or conflicting findings. "
-            "Do not treat repeated claims as additional evidence. "
-            "Name the single most important trade-off explicitly, and "
-            "state the recommendation in the first sentence."
-        )},
+        {"role": "system", "content": system_content},
         # Extension: supply the complete transcript instead of only final arguments.
-        {"role": "user", "content": (
-            f"Case:\n{state['case']}\n\n"
-            f"Complete debate history:\n{format_history(state)}"
-        )},
+        {"role": "user", "content": user_content},
     ])
+    _append_trace({
+        "event": "participant",
+        "participant": "moderator",
+        "input": user_content,
+        "messages": _trace_messages([response]),
+    })
     return {"resolution": response.text}
 
 
@@ -298,15 +366,30 @@ debate_graph = graph.compile()
 
 
 if __name__ == "__main__":
-    result = debate_graph.invoke({
-        "case": CASE,
-        "position_a": "",
-        "position_b": "",
-        "history": [],  # Extension: start with an empty debate transcript.
-        "round": 0,
-        "max_rounds": 2,
-        "resolution": "",
-    })
+    run_id = os.environ.get("DEBATE_RUN_ID", "")
+    if run_id:
+        print(f"[run] {run_id}")
+    started = datetime.now(timezone.utc)
+    invoke_config = None
+    if run_id:
+        invoke_config = {
+            "run_name": run_id,
+            "tags": ["lab5", "merged", run_id],
+            "metadata": {"variant": "merged", "run_id": run_id},
+        }
+    result = debate_graph.invoke(
+        {
+            "case": CASE,
+            "position_a": "",
+            "position_b": "",
+            "history": [],  # Extension: start with an empty debate transcript.
+            "round": 0,
+            "max_rounds": 2,
+            "resolution": "",
+        },
+        config=invoke_config,
+    )
+    elapsed = (datetime.now(timezone.utc) - started).total_seconds()
 
     print("\n--- Final BUILD argument ---")
     print(result["position_a"])
@@ -316,3 +399,32 @@ if __name__ == "__main__":
     print(format_history(result))
     print("\n--- Moderator's resolution ---")
     print(result["resolution"])
+    print(f"\n[elapsed_seconds] {elapsed:.1f}")
+
+    state_path = os.environ.get("DEBATE_STATE_PATH")
+    if state_path:
+        parent = os.path.dirname(state_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "run_id": run_id,
+                    "elapsed_seconds": elapsed,
+                    "round": result["round"],
+                    "position_a": result["position_a"],
+                    "position_b": result["position_b"],
+                    "history": result["history"],
+                    "resolution": result["resolution"],
+                },
+                handle,
+                indent=2,
+            )
+    _append_trace({
+        "event": "final",
+        "run_id": run_id,
+        "elapsed_seconds": elapsed,
+        "round": result["round"],
+        "history": result["history"],
+        "resolution": result["resolution"],
+    })
